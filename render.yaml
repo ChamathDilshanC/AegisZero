@@ -1,0 +1,328 @@
+# Render Blueprint for AegisZero — tuned for Render's FREE tier throughout.
+#
+# Deploy: Render dashboard -> New -> Blueprint -> point at this repo.
+# Render clones with submodules automatically since aegiszero-services,
+# aegiszero-shared, aegiszero-frontend, and aegiszero-infrastructure are all
+# public repos (see .gitmodules).
+#
+# Every backend service is `type: web`, not `pserv` — Render's free plan
+# doesn't support Private Services at all ("service type is not available
+# for this plan" if you try). That means auth-service, user-service,
+# access-service, security-service, audit-service, and notification-service
+# all get a public https://*.onrender.com URL, not just the gateway and
+# frontend. Internal service-to-service calls (http://aegiszero-x-service:
+# PORT) still work the same as pserv would have — Render's internal
+# networking isn't restricted to any one service type — but the
+# */internal/** endpoints access-service and security-service expose for
+# that traffic are consequently reachable from the open internet too.
+# They're locked down with a shared X-Internal-Api-Key header
+# (INTERNAL_API_KEY below, generated once and read by auth-service as the
+# caller and access-service/security-service as the two internal-endpoint
+# owners) rather than relying on network isolation that free tier can't
+# provide. See InternalApiKeyFilter in common-security.
+#
+# There is no Kafka in this deployment. Three dead ends, so none of them get
+# tried again:
+#   - Self-hosting a broker as a Render service. `type: web` health-checks for
+#     an HTTP response, which a raw Kafka broker never gives, so the service
+#     never leaves "no open HTTP ports detected". A background worker would
+#     avoid that, but Render's free plan has no workers.
+#   - Render's own managed Kafka. There isn't one, at any plan.
+#   - Upstash Kafka, which an earlier version of this file did point at. It was
+#     deprecated on 2024-09-11 and shut down on 2025-03-11 — the product no
+#     longer exists, so those instructions could never have worked.
+#
+# Instead EVENT_BACKEND=redis below puts domain events on Redis Streams, using
+# the free Redis already provisioned here for sessions. Consumer groups give
+# the same fan-out and per-consumer offsets Kafka does, so user-service and
+# access-service each still see every user.registered event, and a service
+# that was spun down picks up what it missed when it wakes. Streams are capped
+# with XADD MAXLEN (aegiszero.events.redis.max-stream-length, default 1000) so
+# audit.events can't fill a 25MB Redis.
+#
+# This is a substitution, not a redesign: no service knows which backend is
+# running. Publishers depend on EventPublisher and consumers implement
+# EventSubscription, both in shared/common-messaging, and local
+# docker-compose leaves EVENT_BACKEND unset — which means Kafka, against the
+# broker the compose file runs.
+#
+# Free-tier tradeoffs, read before deploying:
+#
+# - Cold starts. Every service here (Postgres/Redis aside) spins down after
+#   ~15 min idle and takes 30-60s to wake back up on the next request. A
+#   login can chain through gateway -> auth-service -> access-service ->
+#   security-service; if all four are asleep, the first request after a
+#   quiet period can take a couple of minutes. Wake the demo up a few
+#   minutes before showing it to anyone.
+# - Postgres free plan expires ~30 days after creation (Render deletes it
+#   unless you upgrade). Fine for a demo you're actively iterating on; not
+#   for anything you want to leave running unattended for a month.
+# - Redis free plan caps out around 25MB — comfortably enough for sessions
+#   and MFA challenges at demo traffic levels, not for real load.
+# - JAVA_TOOL_OPTIONS below caps each JVM's heap to fit in a 512MB
+#   container. It's tight; under any real concurrent load these will OOM.
+#   That's an acceptable tradeoff for a free portfolio deploy, not for
+#   production.
+#
+# One database, five schemas. Locally each service gets its own Postgres
+# database (auth_db, user_db, ...) via init-databases.sh. That does not
+# translate to Render: the free Postgres plan gives you a single database,
+# `databaseName` below is immutable once the instance exists, and the user
+# Render hands you has no CREATEDB right — so the five databases can be
+# neither declared nor created after the fact. Instead every service points
+# DB_NAME at whatever database the instance actually has (read off it with
+# `property: database`, not assumed) and carves out its own DB_SCHEMA inside
+# it. Flyway creates the schema on first run and keeps its own
+# flyway_schema_history there, so the isolation is the same in practice.
+# Nothing manual is required, and local docker-compose is untouched —
+# DB_SCHEMA is unset there, which means `public` in a per-service database
+# exactly as before.
+#
+# NEXT_PUBLIC_API_BASE_URL / CORS_ALLOWED_ORIGINS below assume Render gives
+# aegiszero-gateway and aegiszero-frontend their default
+# https://<service-name>.onrender.com URLs, which is deterministic *unless*
+# those exact names are already taken by someone else's Render service. If
+# Render renames either one during creation, update these two values (and
+# redeploy the frontend, since NEXT_PUBLIC_* is inlined at build time) to
+# match.
+
+databases:
+  - name: aegiszero-postgres
+    # Holds every service's tables, one schema each — see the note above. No
+    # service reads this name (they take it from `property: database`), and
+    # Render fixes it at creation time anyway, so an already-created instance
+    # keeping an older name here is harmless.
+    databaseName: aegiszero
+    user: aegiszero
+    plan: free
+
+envVarGroups:
+  - name: aegiszero-shared
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ACCESS_TOKEN_TTL_MINUTES
+        value: "15"
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "14"
+      # Domain events ride Redis Streams here rather than Kafka — see the note
+      # at the top of this file. Nothing else needs configuring for it, but
+      # every service that publishes or consumes also needs REDIS_URL, which
+      # has to be set per-service below: env groups can't reference another
+      # service's properties.
+      - key: EVENT_BACKEND
+        value: redis
+      # Locks down access-service's and security-service's /internal/**
+      # endpoints now that they're public web services, not private ones —
+      # see the note at the top of this file.
+      - key: INTERNAL_API_KEY
+        generateValue: true
+      # Keeps each JVM inside a 512MB free-tier container. SerialGC has less
+      # background-thread overhead than the default G1 on a 0.1 CPU instance.
+      - key: JAVA_TOOL_OPTIONS
+        value: "-Xmx300m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"
+
+services:
+  # --------------------------------------------------------------- infra --
+  - type: redis
+    name: aegiszero-redis
+    plan: free
+    ipAllowList: []
+
+  # ---------------------------------------------------------- backend apis --
+  - type: web
+    name: aegiszero-auth-service
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./services/auth-service/Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - fromGroup: aegiszero-shared
+      - key: REDIS_URL
+        fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+      - key: DB_HOST
+        fromDatabase: { name: aegiszero-postgres, property: host }
+      - key: DB_PORT
+        fromDatabase: { name: aegiszero-postgres, property: port }
+      - key: DB_USERNAME
+        fromDatabase: { name: aegiszero-postgres, property: user }
+      - key: DB_PASSWORD
+        fromDatabase: { name: aegiszero-postgres, property: password }
+      # All five services share the one database this instance provides (the
+      # free plan gives you exactly one, and its user has no CREATEDB right),
+      # each isolated in its own DB_SCHEMA. The name is read off the instance
+      # rather than hardcoded: `databaseName` is fixed at creation time, so an
+      # instance created by an earlier version of this file keeps whatever it
+      # was called then — which is exactly why every service used to die with
+      # `database "..._db" does not exist`.
+      - key: DB_NAME
+        fromDatabase: { name: aegiszero-postgres, property: database }
+      - key: DB_SCHEMA
+        value: auth
+      - key: ACCESS_SERVICE_URL
+        value: http://aegiszero-access-service:8083
+      - key: SECURITY_SERVICE_URL
+        value: http://aegiszero-security-service:8084
+
+  - type: web
+    name: aegiszero-user-service
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./services/user-service/Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - fromGroup: aegiszero-shared
+      - key: REDIS_URL
+        fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+      - key: DB_HOST
+        fromDatabase: { name: aegiszero-postgres, property: host }
+      - key: DB_PORT
+        fromDatabase: { name: aegiszero-postgres, property: port }
+      - key: DB_USERNAME
+        fromDatabase: { name: aegiszero-postgres, property: user }
+      - key: DB_PASSWORD
+        fromDatabase: { name: aegiszero-postgres, property: password }
+      - key: DB_NAME
+        fromDatabase: { name: aegiszero-postgres, property: database }
+      - key: DB_SCHEMA
+        value: users
+
+  - type: web
+    name: aegiszero-access-service
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./services/access-service/Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - fromGroup: aegiszero-shared
+      - key: REDIS_URL
+        fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+      - key: DB_HOST
+        fromDatabase: { name: aegiszero-postgres, property: host }
+      - key: DB_PORT
+        fromDatabase: { name: aegiszero-postgres, property: port }
+      - key: DB_USERNAME
+        fromDatabase: { name: aegiszero-postgres, property: user }
+      - key: DB_PASSWORD
+        fromDatabase: { name: aegiszero-postgres, property: password }
+      - key: DB_NAME
+        fromDatabase: { name: aegiszero-postgres, property: database }
+      - key: DB_SCHEMA
+        value: access
+
+  - type: web
+    name: aegiszero-security-service
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./services/security-service/Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - fromGroup: aegiszero-shared
+      - key: DB_HOST
+        fromDatabase: { name: aegiszero-postgres, property: host }
+      - key: DB_PORT
+        fromDatabase: { name: aegiszero-postgres, property: port }
+      - key: DB_USERNAME
+        fromDatabase: { name: aegiszero-postgres, property: user }
+      - key: DB_PASSWORD
+        fromDatabase: { name: aegiszero-postgres, property: password }
+      - key: DB_NAME
+        fromDatabase: { name: aegiszero-postgres, property: database }
+      - key: DB_SCHEMA
+        value: security
+      # Render only exposes connectionString/host/port for a redis resource
+      # (no standalone password) — the URL carries auth, and application.yml
+      # only falls back to REDIS_HOST/PORT when this isn't set.
+      - key: REDIS_URL
+        fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+
+  - type: web
+    name: aegiszero-audit-service
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./services/audit-service/Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - fromGroup: aegiszero-shared
+      - key: REDIS_URL
+        fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+      - key: DB_HOST
+        fromDatabase: { name: aegiszero-postgres, property: host }
+      - key: DB_PORT
+        fromDatabase: { name: aegiszero-postgres, property: port }
+      - key: DB_USERNAME
+        fromDatabase: { name: aegiszero-postgres, property: user }
+      - key: DB_PASSWORD
+        fromDatabase: { name: aegiszero-postgres, property: password }
+      - key: DB_NAME
+        fromDatabase: { name: aegiszero-postgres, property: database }
+      - key: DB_SCHEMA
+        value: audit
+
+  - type: web
+    name: aegiszero-notification-service
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./services/notification-service/Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - fromGroup: aegiszero-shared
+      - key: REDIS_URL
+        fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+      - key: FRONTEND_BASE_URL
+        value: https://aegiszero-frontend.onrender.com
+      # Render's free tier blocks outbound SMTP ports (25/465/587) entirely,
+      # so SMTP_HOST etc. would just time out here — brevo-api sends over
+      # HTTPS (443) instead. See EMAIL_PROVIDER in .env.example for the SMTP
+      # alternative on any host that doesn't block those ports.
+      - key: EMAIL_PROVIDER
+        value: brevo-api
+      - key: BREVO_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: MAIL_FROM_NAME
+        value: AegisZero Security
+
+  # -------------------------------------------------------- public frontend --
+  - type: web
+    name: aegiszero-gateway
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./services/api-gateway/Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - fromGroup: aegiszero-shared
+      - key: REDIS_URL
+        fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+      - key: AUTH_SERVICE_URL
+        value: http://aegiszero-auth-service:8081
+      - key: USER_SERVICE_URL
+        value: http://aegiszero-user-service:8082
+      - key: ACCESS_SERVICE_URL
+        value: http://aegiszero-access-service:8083
+      - key: SECURITY_SERVICE_URL
+        value: http://aegiszero-security-service:8084
+      - key: AUDIT_SERVICE_URL
+        value: http://aegiszero-audit-service:8085
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://aegiszero-frontend.onrender.com
+
+  - type: web
+    name: aegiszero-frontend
+    runtime: docker
+    dockerContext: ./frontend/security-console
+    dockerfilePath: ./frontend/security-console/Dockerfile
+    plan: free
+    envVars:
+      # See the note at the top of this file — this needs a manual redeploy
+      # once aegiszero-gateway's real URL is known.
+      - key: NEXT_PUBLIC_API_BASE_URL
+        value: https://aegiszero-gateway.onrender.com
