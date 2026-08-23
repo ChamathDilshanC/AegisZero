@@ -1,0 +1,272 @@
+name: aegiszero
+
+services:
+  # ---------------------------------------------------------------- infra --
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-aegiszero}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-aegiszero}
+      POSTGRES_DB: aegiszero
+    ports:
+      - "${POSTGRES_HOST_PORT:-5434}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-aegiszero}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:latest
+    ports:
+      - "${KAFKA_HOST_PORT:-9095}:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9095}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "${KAFKA_UI_HOST_PORT:-8091}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: aegiszero
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "${MAILHOG_WEB_HOST_PORT:-8026}:8025" # web UI
+      - "${MAILHOG_SMTP_HOST_PORT:-1026}:1025" # SMTP
+
+  # ------------------------------------------------------------ services --
+  auth-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: auth-service
+    ports:
+      - "8081:8081"
+    environment: &common-env
+      DB_HOST: postgres
+      DB_USERNAME: ${DB_USERNAME:-aegiszero}
+      DB_PASSWORD: ${DB_PASSWORD:-aegiszero}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Every service carries spring-data-redis now (it backs the alternative
+      # Redis Streams event backend), so Boot's Redis health indicator is
+      # active even when EVENT_BACKEND is unset and Kafka is doing the work.
+      # Without this, /actuator/health below reports DOWN.
+      REDIS_HOST: redis
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-change-this-secret-change-this-secret}
+      ACCESS_SERVICE_URL: http://access-service:8083
+      SECURITY_SERVICE_URL: http://security-service:8084
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  user-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: user-service
+    ports:
+      - "8082:8082"
+    environment:
+      <<: *common-env
+      DB_NAME: user_db
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8082/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  access-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: access-service
+    ports:
+      - "8083:8083"
+    environment:
+      <<: *common-env
+      DB_NAME: access_db
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8083/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  security-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: security-service
+    ports:
+      - "8084:8084"
+    environment:
+      <<: *common-env
+      DB_NAME: security_db
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8084/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  audit-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: audit-service
+    ports:
+      - "8085:8085"
+    environment:
+      <<: *common-env
+      DB_NAME: audit_db
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8085/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  notification-service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: notification-service
+    ports:
+      - "8086:8086"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+      # Defaults to smtp + the bundled Mailhog for local dev. Point SMTP_*
+      # at Brevo (or any other SMTP relay) in .env for a real deployment
+      # that allows outbound SMTP - see .env.example. Render doesn't (its
+      # free tier blocks ports 25/465/587), which is what EMAIL_PROVIDER=
+      # brevo-api in render.yaml is for instead.
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-smtp}
+      SMTP_HOST: ${SMTP_HOST:-mailhog}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_AUTH: ${SMTP_AUTH:-false}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      BREVO_API_KEY: ${BREVO_API_KEY:-}
+      MAIL_FROM: ${MAIL_FROM:-no-reply@aegiszero.local}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-AegisZero Security}
+      FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost:3000}
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  api-gateway:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-change-this-secret-change-this-secret}
+      REDIS_HOST: redis
+      AUTH_SERVICE_URL: http://auth-service:8081
+      USER_SERVICE_URL: http://user-service:8082
+      ACCESS_SERVICE_URL: http://access-service:8083
+      SECURITY_SERVICE_URL: http://security-service:8084
+      AUDIT_SERVICE_URL: http://audit-service:8085
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+      access-service:
+        condition: service_healthy
+      security-service:
+        condition: service_healthy
+      audit-service:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend/security-console
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-gateway
+
+volumes:
+  postgres-data:
