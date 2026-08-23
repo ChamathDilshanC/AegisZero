@@ -1,0 +1,12 @@
+[submodule "services"]
+	path = services
+	url = https://github.com/ChamathDilshanC/aegiszero-services.git
+[submodule "shared"]
+	path = shared
+	url = https://github.com/ChamathDilshanC/aegiszero-shared.git
+[submodule "frontend"]
+	path = frontend
+	url = https://github.com/ChamathDilshanC/aegiszero-frontend.git
+[submodule "infrastructure"]
+	path = infrastructure
+	url = https://github.com/ChamathDilshanC/aegiszero-infrastructure.git
