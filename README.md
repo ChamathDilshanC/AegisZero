@@ -2,7 +2,7 @@
 
 An enterprise-style Zero-Trust IAM platform built as Spring Boot microservices: adaptive authentication, MFA, device and session intelligence, RBAC, event-driven risk scoring, and immutable audit logging — fronted by a Next.js security console.
 
-See [architecture.md](architecture.md) and [development.md](development.md) for the full design and phased build plan this implementation follows.
+See [architecture.md](architecture.md) and [development.md](development.md) for the full design and phased build plan this implementation follows, and [deployment.md](deployment.md) to put it on Render.
 
 ## Repo structure
 
@@ -97,6 +97,7 @@ frontend/          submodule (aegiszero-frontend): security-console, the Next.js
 infrastructure/    submodule (aegiszero-infrastructure): Postgres multi-DB init script
 docker-compose.yml  full local stack
 render.yaml         Render Blueprint for a cloud deployment — see below
+deployment.md       step-by-step Render deployment guide
 Dockerfile          shared multi-stage build for every Java service (docker build --build-arg SERVICE_NAME=...)
 ```
 
@@ -114,6 +115,8 @@ git add services && git commit -m "chore: bump services submodule"
 ```
 
 ## Deploying to Render
+
+**[deployment.md](deployment.md) is the step-by-step guide** — start there if you are actually deploying. What follows is the summary of what you are getting into.
 
 `render.yaml` at the repo root is a [Render Blueprint](https://render.com/docs/blueprint-spec) covering Postgres, Redis, all 7 Java services, and the frontend — every service on Render's **free** plan. In the Render dashboard: **New → Blueprint**, point it at this repo (Render follows the submodules automatically since they're all public).
 
