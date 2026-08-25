@@ -298,8 +298,15 @@ services:
       - fromGroup: aegiszero-shared
       - key: REDIS_URL
         fromService: { type: redis, name: aegiszero-redis, property: connectionString }
+      # sync: false, not a literal. Render appends a suffix when a service name
+      # is taken (aegiszero-frontend -> aegiszero-frontend-y415), and unlike the
+      # internal hostnames above there is no fromService property that yields a
+      # public onrender.com URL - so this cannot be derived and has to be typed
+      # in. Declaring it with a `value:` here would be worse than useless: every
+      # blueprint sync would overwrite whatever was corrected in the dashboard,
+      # silently putting the wrong host back.
       - key: FRONTEND_BASE_URL
-        value: https://aegiszero-frontend.onrender.com
+        sync: false
       # Render's free tier blocks outbound SMTP ports (25/465/587) entirely,
       # so SMTP_HOST etc. would just time out here — brevo-api sends over
       # HTTPS (443) instead. See EMAIL_PROVIDER in .env.example for the SMTP
@@ -337,8 +344,10 @@ services:
         fromService: { type: web, name: aegiszero-security-service, property: hostport }
       - key: AUDIT_SERVICE_HOSTPORT
         fromService: { type: web, name: aegiszero-audit-service, property: hostport }
+      # The console's real origin. See the note on FRONTEND_BASE_URL: prompted
+      # rather than declared, so a sync cannot clobber it.
       - key: CORS_ALLOWED_ORIGINS
-        value: https://aegiszero-frontend.onrender.com
+        sync: false
 
   - type: web
     name: aegiszero-frontend
@@ -347,7 +356,9 @@ services:
     dockerfilePath: ./frontend/security-console/Dockerfile
     plan: free
     envVars:
-      # See the note at the top of this file — this needs a manual redeploy
-      # once aegiszero-gateway's real URL is known.
+      # The gateway's real public URL. Prompted rather than declared, so a
+      # sync cannot clobber it - see the note on FRONTEND_BASE_URL above.
+      # This one is inlined into the client bundle at build time, so changing
+      # it needs a rebuild with the build cache cleared, not just a restart.
       - key: NEXT_PUBLIC_API_BASE_URL
-        value: https://aegiszero-gateway.onrender.com
+        sync: false
