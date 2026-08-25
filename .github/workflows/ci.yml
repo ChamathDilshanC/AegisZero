@@ -33,7 +33,13 @@ jobs:
       run:
         working-directory: frontend/security-console
     steps:
+      # Recursive, same as the backend job: security-console lives in the
+      # aegiszero-frontend submodule, so without this the working-directory
+      # above does not exist, npm ci has nothing to install, and setup-node
+      # fails resolving cache-dependency-path before any of that.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Node 22
         uses: actions/setup-node@v4
