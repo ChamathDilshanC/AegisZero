@@ -178,10 +178,15 @@ services:
         fromDatabase: { name: aegiszero-postgres, property: database }
       - key: DB_SCHEMA
         value: auth
-      - key: ACCESS_SERVICE_URL
-        value: http://aegiszero-access-service:8083
-      - key: SECURITY_SERVICE_URL
-        value: http://aegiszero-security-service:8084
+      # host:port read off the service rather than a hardcoded URL. Render
+      # suffixes a service name when the plain one is taken, so
+      # http://aegiszero-access-service:8083 can point at a host that does not
+      # resolve - which is exactly how every call through the gateway started
+      # failing with a 500. application.yml prefixes the scheme.
+      - key: ACCESS_SERVICE_HOSTPORT
+        fromService: { type: web, name: aegiszero-access-service, property: hostport }
+      - key: SECURITY_SERVICE_HOSTPORT
+        fromService: { type: web, name: aegiszero-security-service, property: hostport }
 
   - type: web
     name: aegiszero-user-service
@@ -320,16 +325,18 @@ services:
       - fromGroup: aegiszero-shared
       - key: REDIS_URL
         fromService: { type: redis, name: aegiszero-redis, property: connectionString }
-      - key: AUTH_SERVICE_URL
-        value: http://aegiszero-auth-service:8081
-      - key: USER_SERVICE_URL
-        value: http://aegiszero-user-service:8082
-      - key: ACCESS_SERVICE_URL
-        value: http://aegiszero-access-service:8083
-      - key: SECURITY_SERVICE_URL
-        value: http://aegiszero-security-service:8084
-      - key: AUDIT_SERVICE_URL
-        value: http://aegiszero-audit-service:8085
+      # See the note on auth-service above: host:port comes from the service
+      # itself so the real name is used whatever Render called it.
+      - key: AUTH_SERVICE_HOSTPORT
+        fromService: { type: web, name: aegiszero-auth-service, property: hostport }
+      - key: USER_SERVICE_HOSTPORT
+        fromService: { type: web, name: aegiszero-user-service, property: hostport }
+      - key: ACCESS_SERVICE_HOSTPORT
+        fromService: { type: web, name: aegiszero-access-service, property: hostport }
+      - key: SECURITY_SERVICE_HOSTPORT
+        fromService: { type: web, name: aegiszero-security-service, property: hostport }
+      - key: AUDIT_SERVICE_HOSTPORT
+        fromService: { type: web, name: aegiszero-audit-service, property: hostport }
       - key: CORS_ALLOWED_ORIGINS
         value: https://aegiszero-frontend.onrender.com
 
