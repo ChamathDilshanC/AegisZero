@@ -59,10 +59,12 @@
 #   for anything you want to leave running unattended for a month.
 # - Redis free plan caps out around 25MB — comfortably enough for sessions
 #   and MFA challenges at demo traffic levels, not for real load.
-# - JAVA_TOOL_OPTIONS below caps each JVM's heap to fit in a 512MB
-#   container. It's tight; under any real concurrent load these will OOM.
-#   That's an acceptable tradeoff for a free portfolio deploy, not for
-#   production.
+# - JAVA_TOOL_OPTIONS below sizes each JVM to fit a 512MB container. It is
+#   tight - heap, metaspace, code cache and native together leave very little
+#   headroom - and under any real concurrent load these will OOM. Acceptable
+#   for a free portfolio deploy, not for production. If services start failing
+#   to bind their port again, this is the first thing to look at: it means the
+#   classpath grew and metaspace no longer fits.
 #
 # One database, five schemas. Locally each service gets its own Postgres
 # database (auth_db, user_db, ...) via init-databases.sh. That does not
@@ -117,10 +119,26 @@ envVarGroups:
       # see the note at the top of this file.
       - key: INTERNAL_API_KEY
         generateValue: true
-      # Keeps each JVM inside a 512MB free-tier container. SerialGC has less
-      # background-thread overhead than the default G1 on a 0.1 CPU instance.
+      # Sized to actually fit a 512MB free-tier container. The previous
+      # -Xmx300m -XX:MaxMetaspaceSize=128m did not: 300 heap + 128 metaspace +
+      # ~50 code cache + ~50 JVM native is already over 512 before thread
+      # stacks, and 128m of metaspace is far too little for the ~100 jars each
+      # service now carries (Hibernate, Security, Data JPA, Data Redis and
+      # Kafka). The result was continuous full GCs trying to reclaim class
+      # metadata - services crawled, took 40s+ just to build the application
+      # context, and never reached the point of binding a port before Render
+      # gave up scanning.
+      #
+      #   MaxRAMPercentage  heap as a share of the container rather than a
+      #                     fixed figure, so it adapts if the plan changes
+      #   MaxMetaspaceSize  room for the classes actually being loaded
+      #   UseSerialGC       less background-thread overhead than G1 at 0.1 CPU
+      #   TieredStopAtLevel C1 only. Gives up peak throughput, which matters
+      #                     far less here than startup time and code cache
+      #   Xss               200 Tomcat threads at the 1MB default reserve more
+      #                     stack than the container has to spare
       - key: JAVA_TOOL_OPTIONS
-        value: "-Xmx300m -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC"
+        value: "-XX:MaxRAMPercentage=45 -XX:MaxMetaspaceSize=192m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xss512k"
 
 services:
   # --------------------------------------------------------------- infra --
