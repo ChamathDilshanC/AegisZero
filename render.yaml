@@ -10,16 +10,29 @@
 # for this plan" if you try). That means auth-service, user-service,
 # access-service, security-service, audit-service, and notification-service
 # all get a public https://*.onrender.com URL, not just the gateway and
-# frontend. Internal service-to-service calls (http://aegiszero-x-service:
-# PORT) still work the same as pserv would have — Render's internal
-# networking isn't restricted to any one service type — but the
-# */internal/** endpoints access-service and security-service expose for
-# that traffic are consequently reachable from the open internet too.
-# They're locked down with a shared X-Internal-Api-Key header
-# (INTERNAL_API_KEY below, generated once and read by auth-service as the
-# caller and access-service/security-service as the two internal-endpoint
-# owners) rather than relying on network isolation that free tier can't
-# provide. See InternalApiKeyFilter in common-security.
+# frontend.
+#
+# Every internal service-to-service call — gateway to all five backends,
+# auth-service to access-service and security-service — goes over each
+# service's PUBLIC URL, not Render's private network. That is not a
+# workaround; it is the only option here. Render's own docs are explicit:
+# "Free web services can send private network requests, but they can't
+# receive them." An earlier version of this file assumed the opposite (the
+# comment used to claim internal calls "work the same as pserv would have"),
+# which is why every one of them failed with UnknownHostException /
+# NXDOMAIN — a free web service has no private-network address to resolve
+# to in the first place, so no hostname was ever going to work, correctly
+# spelled or not. Render's own downstream service names, prompted for below
+# and marked sync: false, are the only thing that actually reaches them.
+#
+# Since every backend is consequently reachable from the open internet
+# already, access-service's and security-service's */internal/** endpoints
+# are locked down with a shared X-Internal-Api-Key header (INTERNAL_API_KEY
+# below, generated once and read by auth-service as the caller and
+# access-service/security-service as the two internal-endpoint owners)
+# rather than relying on network isolation that free tier cannot provide
+# regardless. See InternalApiKeyFilter in common-security. Every other
+# endpoint is protected the same way it always was: a valid JWT.
 #
 # There is no Kafka in this deployment. Three dead ends, so none of them get
 # tried again:
@@ -80,13 +93,16 @@
 # DB_SCHEMA is unset there, which means `public` in a per-service database
 # exactly as before.
 #
-# NEXT_PUBLIC_API_BASE_URL / CORS_ALLOWED_ORIGINS below assume Render gives
-# aegiszero-gateway and aegiszero-frontend their default
-# https://<service-name>.onrender.com URLs, which is deterministic *unless*
-# those exact names are already taken by someone else's Render service. If
-# Render renames either one during creation, update these two values (and
-# redeploy the frontend, since NEXT_PUBLIC_* is inlined at build time) to
-# match.
+# Every public URL referenced below — the gateway and frontend origins, and
+# now every downstream service URL too — is sync: false rather than a
+# declared value, and for the same two reasons in every case: Render decides
+# the real hostname (base name, or a random suffix if that name is taken) only
+# once the service is created, and a value declared with `value:` is owned by
+# the blueprint, so a later sync would silently overwrite anything corrected
+# by hand. Fill these in from the dashboard after Step 1 creates the services;
+# see deployment.md. NEXT_PUBLIC_API_BASE_URL is inlined into the frontend's
+# JS bundle at build time, so changing it needs a rebuild with the build cache
+# cleared, not a restart.
 
 databases:
   - name: aegiszero-postgres
@@ -178,15 +194,15 @@ services:
         fromDatabase: { name: aegiszero-postgres, property: database }
       - key: DB_SCHEMA
         value: auth
-      # host:port read off the service rather than a hardcoded URL. Render
-      # suffixes a service name when the plain one is taken, so
-      # http://aegiszero-access-service:8083 can point at a host that does not
-      # resolve - which is exactly how every call through the gateway started
-      # failing with a 500. application.yml prefixes the scheme.
-      - key: ACCESS_SERVICE_HOSTPORT
-        fromService: { type: web, name: aegiszero-access-service, property: hostport }
-      - key: SECURITY_SERVICE_HOSTPORT
-        fromService: { type: web, name: aegiszero-security-service, property: hostport }
+      # Public URLs, not private hostnames — see the note at the top of this
+      # file: a free web service cannot receive on Render's private network at
+      # all, so there is no hostname here that could ever resolve. sync: false
+      # because Render decides the real suffix at creation time and there is
+      # no fromService property for a service's own public URL.
+      - key: ACCESS_SERVICE_URL
+        sync: false
+      - key: SECURITY_SERVICE_URL
+        sync: false
 
   - type: web
     name: aegiszero-user-service
@@ -332,18 +348,20 @@ services:
       - fromGroup: aegiszero-shared
       - key: REDIS_URL
         fromService: { type: redis, name: aegiszero-redis, property: connectionString }
-      # See the note on auth-service above: host:port comes from the service
-      # itself so the real name is used whatever Render called it.
-      - key: AUTH_SERVICE_HOSTPORT
-        fromService: { type: web, name: aegiszero-auth-service, property: hostport }
-      - key: USER_SERVICE_HOSTPORT
-        fromService: { type: web, name: aegiszero-user-service, property: hostport }
-      - key: ACCESS_SERVICE_HOSTPORT
-        fromService: { type: web, name: aegiszero-access-service, property: hostport }
-      - key: SECURITY_SERVICE_HOSTPORT
-        fromService: { type: web, name: aegiszero-security-service, property: hostport }
-      - key: AUDIT_SERVICE_HOSTPORT
-        fromService: { type: web, name: aegiszero-audit-service, property: hostport }
+      # Public URLs — see the note on auth-service above and at the top of this
+      # file. All five, sync: false: Render decides the real suffix at
+      # creation time and there is no way to derive a service's own public URL
+      # from render.yaml.
+      - key: AUTH_SERVICE_URL
+        sync: false
+      - key: USER_SERVICE_URL
+        sync: false
+      - key: ACCESS_SERVICE_URL
+        sync: false
+      - key: SECURITY_SERVICE_URL
+        sync: false
+      - key: AUDIT_SERVICE_URL
+        sync: false
       # The console's real origin. See the note on FRONTEND_BASE_URL: prompted
       # rather than declared, so a sync cannot clobber it.
       - key: CORS_ALLOWED_ORIGINS
