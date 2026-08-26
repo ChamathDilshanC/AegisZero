@@ -1,0 +1,74 @@
+name: Keep Render services warm
+
+# This is a workaround for Render's free plan, not a real fix. Every service
+# in render.yaml spins down after ~15 min idle, and a login chains through
+# four of them (gateway -> auth -> access -> security), so if any one is
+# asleep the whole request stalls (the gateway now waits up to 120s for a
+# cold response instead of failing outright at 15s - see api-gateway's
+# httpclient.response-timeout - but it is still slow). Pinging every service
+# on an interval well under 15 minutes keeps them all warm so a real visitor
+# never eats a cold start.
+#
+# What this does NOT do: build, test, or deploy anything - that is
+# ci.yml. This workflow only sends GET requests on a timer. It also cannot
+# guarantee zero cold starts - GitHub's own docs note scheduled workflows can
+# be delayed under load - and it is real traffic Render serves for free, not
+# a loophole. The actual fix is Render's paid plan, which does not spin down
+# at all; this is the free-tier substitute.
+#
+# Setup: repo Settings -> Secrets and variables -> Actions -> Variables ->
+# add RENDER_APP_SUFFIX with whatever Render appended to your service names
+# (visible in each service's URL - e.g. "y415" from
+# aegiszero-gateway-y415.onrender.com). All eight services were created in
+# the same Blueprint apply, so they should all carry the same suffix; if one
+# doesn't, override it below in the `hosts` list rather than changing the
+# shared variable.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping every backend service and the frontend
+        env:
+          SUFFIX: ${{ vars.RENDER_APP_SUFFIX }}
+        run: |
+          if [ -z "$SUFFIX" ]; then
+            echo "::error::RENDER_APP_SUFFIX repository variable is not set - see the comment at the top of this workflow file."
+            exit 1
+          fi
+
+          hosts=(
+            "auth-service|https://aegiszero-auth-service-${SUFFIX}.onrender.com/actuator/health"
+            "user-service|https://aegiszero-user-service-${SUFFIX}.onrender.com/actuator/health"
+            "access-service|https://aegiszero-access-service-${SUFFIX}.onrender.com/actuator/health"
+            "security-service|https://aegiszero-security-service-${SUFFIX}.onrender.com/actuator/health"
+            "audit-service|https://aegiszero-audit-service-${SUFFIX}.onrender.com/actuator/health"
+            "notification-service|https://aegiszero-notification-service-${SUFFIX}.onrender.com/actuator/health"
+            "gateway|https://aegiszero-gateway-${SUFFIX}.onrender.com/actuator/health"
+            "frontend|https://aegiszero-frontend-${SUFFIX}.onrender.com/"
+          )
+
+          failures=0
+          for entry in "${hosts[@]}"; do
+            name="${entry%%|*}"
+            url="${entry#*|}"
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$url" 2>/dev/null)
+            code="${code:-000}"
+            if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
+              echo "OK    $name -> $code"
+            else
+              echo "::warning::$name did not respond as expected ($code) at $url"
+              failures=$((failures + 1))
+            fi
+          done
+
+          # A 3xx/4xx still proves the service woke up and answered - only
+          # a timeout or 5xx counts as this run not having done its job.
+          if [ "$failures" -gt 0 ]; then
+            echo "::warning::$failures service(s) may still be cold or unreachable - check the Render dashboard."
+          fi
