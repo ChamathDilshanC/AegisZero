@@ -203,6 +203,17 @@ services:
         sync: false
       - key: SECURITY_SERVICE_URL
         sync: false
+      # auth-service's own public URL — same sync: false reasoning as above,
+      # since only Render knows the real suffix. Used to build the one-click
+      # Approve/Reject links in the admin-access-request email; those are
+      # opened straight from an inbox, so they have to point at auth-service
+      # directly rather than through the frontend.
+      - key: PUBLIC_BASE_URL
+        sync: false
+      # Not a secret, just who gets the "someone wants admin access" email.
+      # Blank disables the feature (see RegistrationService.requestAdminAccess).
+      - key: ADMIN_REQUEST_NOTIFY_EMAIL
+        value: chamathdilshan.dev@gmail.com
 
   - type: web
     name: aegiszero-user-service
