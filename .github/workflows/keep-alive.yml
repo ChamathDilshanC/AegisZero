@@ -1,43 +1,75 @@
 name: Keep Render services warm
 
-# This is a workaround for Render's free plan, not a real fix. Every service
-# in render.yaml spins down after ~15 min idle, and a login chains through
-# four of them (gateway -> auth -> access -> security), so if any one is
-# asleep the whole request stalls (the gateway now waits up to 120s for a
-# cold response instead of failing outright at 15s - see api-gateway's
-# httpclient.response-timeout - but it is still slow). Pinging every service
-# on an interval well under 15 minutes keeps them all warm so a real visitor
-# never eats a cold start.
+# A workaround for Render's free plan, not a real fix. Every service in
+# render.yaml spins down after ~15 min idle, and a login chains through four
+# of them (gateway -> auth -> access -> security), so if any one is asleep
+# the whole request stalls (the gateway waits up to 120s for a cold response
+# - see api-gateway's httpclient.response-timeout - but it is still slow).
+# Hitting every service on a short interval keeps them all warm so a real
+# visitor never eats a cold start.
 #
-# What this does NOT do: build, test, or deploy anything - that is
-# ci.yml. This workflow only sends GET requests on a timer. It also cannot
-# guarantee zero cold starts - GitHub's own docs note scheduled workflows can
-# be delayed under load - and it is real traffic Render serves for free, not
-# a loophole. The actual fix is Render's paid plan, which does not spin down
-# at all; this is the free-tier substitute.
+# Why every 5 minutes and two rounds per run, when spin-down is ~15 min:
+# GitHub's own docs warn that scheduled workflows "can be delayed during
+# periods of high loads" and are sometimes dropped entirely. A single */15
+# (or the old */10) schedule leaves no margin - one skipped run and a
+# service is already cold. So:
+#   - schedule every 5 minutes, and
+#   - inside each run, ping once, wait ~3 min, ping again.
+# Effective coverage is a hit roughly every 2-3 min while runs land on time,
+# and even a couple of consecutive skipped runs stay under the 15 min line.
+#
+# Security notes (this is the "look at security while adding it" part):
+#   - The only thing hit is GET /actuator/health, which is already
+#     permitAll in every service's SecurityConfig and runs with
+#     `management.endpoint.health.show-details: never`, so the response is
+#     just {"status":"UP"} - no build info, no component detail, nothing an
+#     anonymous internet client couldn't already get. Do NOT "lock this
+#     down" with a shared secret: Render's own healthCheckPath probes the
+#     same URL, so gating it would take the services offline.
+#   - No credentials are added. An authenticated warm-up (logging in every
+#     5 min) was considered and rejected: it means a long-lived password in
+#     CI secrets plus constant auth/DB load, which is a worse security
+#     posture than anonymous health pings, not a better one.
+#   - The workflow has `permissions: {}` (it needs no repo token - there is
+#     no checkout), a concurrency group so delayed runs can't pile up, and
+#     curl is pinned to `--proto '=https'` with redirects disabled so a
+#     hijacked/misconfigured host can't bounce the request elsewhere.
+#   - RENDER_APP_SUFFIX is a repository *variable*, not a secret, on purpose:
+#     it is already visible in every service's public URL.
+#
+# What this does NOT do: build, test, or deploy anything - that is ci.yml.
+# It also cannot guarantee zero cold starts. The actual fix is Render's paid
+# plan, which does not spin down at all.
 #
 # Setup: repo Settings -> Secrets and variables -> Actions -> Variables ->
 # add RENDER_APP_SUFFIX with whatever Render appended to your service names
 # (visible in each service's URL - e.g. "y415" from
 # aegiszero-gateway-y415.onrender.com). All eight services were created in
-# the same Blueprint apply, so they should all carry the same suffix; if one
-# doesn't, override it below in the `hosts` list rather than changing the
-# shared variable.
+# the same Blueprint apply, so they should share one suffix; if one doesn't,
+# override it in the `hosts` list below rather than the shared variable.
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: keep-render-warm
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Ping every backend service and the frontend
         env:
           SUFFIX: ${{ vars.RENDER_APP_SUFFIX }}
         run: |
-          if [ -z "$SUFFIX" ]; then
+          set -u
+          if [ -z "${SUFFIX:-}" ]; then
             echo "::error::RENDER_APP_SUFFIX repository variable is not set - see the comment at the top of this workflow file."
             exit 1
           fi
@@ -53,22 +85,49 @@ jobs:
             "frontend|https://aegiszero-frontend-${SUFFIX}.onrender.com/"
           )
 
-          failures=0
-          for entry in "${hosts[@]}"; do
-            name="${entry%%|*}"
-            url="${entry#*|}"
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$url" 2>/dev/null)
-            code="${code:-000}"
-            if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
-              echo "OK    $name -> $code"
-            else
-              echo "::warning::$name did not respond as expected ($code) at $url"
-              failures=$((failures + 1))
-            fi
-          done
+          ping_one() {
+            # HTTPS only, no redirects to another host, identifiable UA so the
+            # hit is obvious in Render's access logs. A cold service can take
+            # 30-60s to answer, hence --max-time 90.
+            curl -sS -o /dev/null -w "%{http_code}" \
+              --proto '=https' --tlsv1.2 --max-redirs 0 \
+              --connect-timeout 15 --max-time 90 \
+              -A "aegiszero-keepalive (+https://github.com/${GITHUB_REPOSITORY:-aegiszero})" \
+              "$1" 2>/dev/null || echo "000"
+          }
 
-          # A 3xx/4xx still proves the service woke up and answered - only
-          # a timeout or 5xx counts as this run not having done its job.
-          if [ "$failures" -gt 0 ]; then
-            echo "::warning::$failures service(s) may still be cold or unreachable - check the Render dashboard."
+          run_round() {
+            local round="$1" failures=0
+            echo "--- round $round ---"
+            for entry in "${hosts[@]}"; do
+              name="${entry%%|*}"
+              url="${entry#*|}"
+              code="$(ping_one "$url")"
+              # Any 2xx/3xx/4xx proves the service woke and answered; only a
+              # timeout (000) or 5xx means this run did not do its job.
+              if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then
+                echo "OK    $name -> $code"
+              else
+                echo "::warning::$name did not respond as expected ($code) at $url"
+                failures=$((failures + 1))
+              fi
+            done
+            return $failures
+          }
+
+          run_round 1 || true
+
+          # Bridge the gap to the next scheduled run in case that one is
+          # delayed or dropped.
+          sleep 180
+
+          run_round 2 || round2_failures=$?
+          round2_failures=${round2_failures:-0}
+
+          if [ "$round2_failures" -ge "${#hosts[@]}" ]; then
+            echo "::error::every service failed to respond in round 2 - check the Render dashboard, this is not just a cold start."
+            exit 1
+          fi
+          if [ "$round2_failures" -gt 0 ]; then
+            echo "::warning::$round2_failures service(s) still cold or unreachable after round 2."
           fi
